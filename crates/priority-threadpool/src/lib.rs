@@ -91,17 +91,18 @@ impl<P: Priority + Clone + Send + 'static> ThreadPool<P> {
                         thread_waiting.store(true, Ordering::Release);
 
                         while !should_stop.load(Ordering::Relaxed) {
+                            // TODO(mdeand): This probably doesn't need to happen here
                             match util::atomic_saturating_sub(&jobs_queued, 1) {
                                 (old, new) if old > 0 => {
-                                    println!("{} jobs in queue", new);
-
                                     if let Some(runnable) = queue.pop() {
                                         thread_waiting.store(false, Ordering::Release);
 
+                                        /*
                                         println!(
                                             "Thread {:?} running job...",
                                             std::thread::current().id()
                                         );
+                                        */
 
                                         runnable.run();
                                     }
@@ -153,6 +154,12 @@ impl<P: Priority + Clone + Send + 'static> ThreadPool<P> {
     pub fn queue(&self, priority: &P, job: Runnable) {
         self.jobs_queued.fetch_add(1, Ordering::SeqCst);
         self.queue.push(priority, job);
+
+        // TODO(mdeand): Unparking when the thread is unparked will cause
+        // TODO(mdeand): the next invoation of park() on that given thread
+        // TODO(mdeand): to not block. This isn't a terrible issue currently
+        // TODO(mdeand): however this implementation could be more efficient.
+
         //self.wake();
     }
 }
