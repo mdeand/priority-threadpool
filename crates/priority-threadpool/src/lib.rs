@@ -21,13 +21,13 @@ pub trait Priority {
 }
 
 #[derive(Clone)]
-struct PriorityQueue<P: Priority> {
-    stacks: Arc<Vec<Stack<Runnable>>>,
+struct PriorityQueue<P: Priority, M = ()> {
+    stacks: Arc<Vec<Stack<Runnable<M>>>>,
     _phantom: PhantomData<P>,
 }
 
-impl<P: Priority> PriorityQueue<P> {
-    fn pop(&self) -> Option<Runnable> {
+impl<P: Priority, M> PriorityQueue<P, M> {
+    fn pop(&self) -> Option<Runnable<M>> {
         for ix in 0..P::COUNT {
             let stack = &self.stacks[ix];
 
@@ -39,7 +39,7 @@ impl<P: Priority> PriorityQueue<P> {
         None
     }
 
-    fn push(&self, priority: &P, runnable: Runnable) {
+    fn push(&self, priority: &P, runnable: Runnable<M>) {
         let index = priority.index();
 
         assert!(index < P::COUNT);
@@ -56,15 +56,19 @@ impl<P: Priority> PriorityQueue<P> {
     }
 }
 
-pub struct ThreadPool<P: Priority + Clone> {
+pub struct ThreadPool<P: Priority + Clone, M = ()> {
     jobs_queued: Arc<AtomicUsize>,
     should_stop: Arc<AtomicBool>,
     waiting: Vec<Arc<AtomicBool>>,
     threads: Vec<JoinHandle<()>>,
-    queue: PriorityQueue<P>,
+    queue: PriorityQueue<P, M>,
 }
 
-impl<P: Priority + Clone + Send + 'static> ThreadPool<P> {
+impl<P, M> ThreadPool<P, M>
+where
+    P: Priority + Clone + Send + 'static,
+    M: Clone + Send + Sync + 'static,
+{
     pub fn new(nworkers: usize) -> Self {
         let jobs_queued = Arc::new(AtomicUsize::new(0));
 
@@ -151,7 +155,7 @@ impl<P: Priority + Clone + Send + 'static> ThreadPool<P> {
         }
     }
 
-    pub fn queue(&self, priority: &P, job: Runnable) {
+    pub fn queue(&self, priority: &P, job: Runnable<M>) {
         self.jobs_queued.fetch_add(1, Ordering::SeqCst);
         self.queue.push(priority, job);
 
