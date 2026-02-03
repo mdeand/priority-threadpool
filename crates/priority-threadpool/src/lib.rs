@@ -22,12 +22,30 @@ pub trait Priority {
 
 #[derive(Clone)]
 struct PriorityQueue<P: Priority, M = ()> {
-    stacks: Arc<Vec<Stack<Runnable<M>>>>,
+    stacks: Arc<Vec<Stack<Job<M>>>>,
     _phantom: PhantomData<P>,
 }
 
+struct Job<M> {
+    // Execute after duration.
+    after: Option<std::time::Duration>,
+    runnable: Runnable<M>,
+}
+
+impl<M> Job<M> {
+    fn run(self) -> bool {
+        // TODO(mdeand): This could be much better instead of occupying an entire thread.
+
+        if let Some(after) = self.after {
+            std::thread::sleep(after);
+        }
+
+        self.runnable.run()
+    }
+}
+
 impl<P: Priority, M> PriorityQueue<P, M> {
-    fn pop(&self) -> Option<Runnable<M>> {
+    fn pop(&self) -> Option<Job<M>> {
         for ix in 0..P::COUNT {
             let stack = &self.stacks[ix];
 
@@ -39,13 +57,13 @@ impl<P: Priority, M> PriorityQueue<P, M> {
         None
     }
 
-    fn push(&self, priority: &P, runnable: Runnable<M>) {
+    fn push(&self, priority: &P, job: Job<M>) {
         let index = priority.index();
 
         assert!(index < P::COUNT);
         assert!(index < self.stacks.len());
 
-        self.stacks[priority.index()].push(runnable);
+        self.stacks[priority.index()].push(job);
     }
 
     pub fn new() -> Self {
@@ -155,9 +173,38 @@ where
         }
     }
 
-    pub fn queue(&self, priority: &P, job: Runnable<M>) {
+    pub fn queue(&self, priority: &P, runnable: Runnable<M>) {
         self.jobs_queued.fetch_add(1, Ordering::SeqCst);
-        self.queue.push(priority, job);
+        self.queue.push(
+            priority,
+            Job {
+                after: None,
+                runnable,
+            },
+        );
+
+        // TODO(mdeand): Unparking when the thread is unparked will cause
+        // TODO(mdeand): the next invoation of park() on that given thread
+        // TODO(mdeand): to not block. This isn't a terrible issue currently
+        // TODO(mdeand): however this implementation could be more efficient.
+
+        //self.wake();
+    }
+
+    pub fn queue_delayed(
+        &self,
+        priority: &P,
+        duration: std::time::Duration,
+        runnable: Runnable<M>,
+    ) {
+        self.jobs_queued.fetch_add(1, Ordering::SeqCst);
+        self.queue.push(
+            priority,
+            Job {
+                after: Some(duration),
+                runnable,
+            },
+        );
 
         // TODO(mdeand): Unparking when the thread is unparked will cause
         // TODO(mdeand): the next invoation of park() on that given thread
