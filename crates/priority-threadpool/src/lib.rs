@@ -1,5 +1,6 @@
 use std::{
     marker::PhantomData,
+    mem::MaybeUninit,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -14,6 +15,63 @@ use lockfree::stack::Stack;
 mod util;
 //mod dropper;
 
+/// Type-erased `Runnable<M>` stored inline (pointer-sized).
+struct ErasedRunnable {
+    storage: MaybeUninit<*mut ()>,
+    run_fn: unsafe fn(*mut u8) -> bool,
+    drop_fn: unsafe fn(*mut u8),
+}
+
+// Safety: Runnable<M> is Send + Sync for all M.
+unsafe impl Send for ErasedRunnable {}
+unsafe impl Sync for ErasedRunnable {}
+
+impl ErasedRunnable {
+    fn new<M: Send + Sync + 'static>(runnable: Runnable<M>) -> Self {
+        assert!(
+            std::mem::size_of::<Runnable<M>>() <= std::mem::size_of::<*mut ()>(),
+            "Runnable<M> is larger than expected",
+        );
+        assert!(
+            std::mem::align_of::<Runnable<M>>() <= std::mem::align_of::<*mut ()>(),
+            "Runnable<M> has stricter alignment than expected",
+        );
+
+        let mut storage = MaybeUninit::<*mut ()>::uninit();
+        unsafe {
+            std::ptr::write(storage.as_mut_ptr().cast::<Runnable<M>>(), runnable);
+        }
+
+        unsafe fn run_erased<M>(ptr: *mut u8) -> bool {
+            let runnable = unsafe { std::ptr::read(ptr.cast::<Runnable<M>>()) };
+            runnable.run()
+        }
+
+        unsafe fn drop_erased<M>(ptr: *mut u8) {
+            unsafe { std::ptr::drop_in_place(ptr.cast::<Runnable<M>>()) };
+        }
+
+        ErasedRunnable {
+            storage,
+            run_fn: run_erased::<M>,
+            drop_fn: drop_erased::<M>,
+        }
+    }
+
+    fn run(mut self) -> bool {
+        let result = unsafe { (self.run_fn)(self.storage.as_mut_ptr().cast::<u8>()) };
+        // run() consumed the inner Runnable, skip Drop.
+        std::mem::forget(self);
+        result
+    }
+}
+
+impl Drop for ErasedRunnable {
+    fn drop(&mut self) {
+        unsafe { (self.drop_fn)(self.storage.as_mut_ptr().cast::<u8>()) };
+    }
+}
+
 pub trait Priority {
     const COUNT: usize;
 
@@ -21,18 +79,18 @@ pub trait Priority {
 }
 
 #[derive(Clone)]
-struct PriorityQueue<P: Priority, M = ()> {
-    stacks: Arc<Vec<Stack<Job<M>>>>,
+struct PriorityQueue<P: Priority> {
+    stacks: Arc<Vec<Stack<Job>>>,
     _phantom: PhantomData<P>,
 }
 
-struct Job<M> {
+struct Job {
     // Execute after duration.
     after: Option<std::time::Duration>,
-    runnable: Runnable<M>,
+    runnable: ErasedRunnable,
 }
 
-impl<M> Job<M> {
+impl Job {
     fn run(self) -> bool {
         // TODO(mdeand): This could be much better instead of occupying an entire thread.
 
@@ -44,8 +102,8 @@ impl<M> Job<M> {
     }
 }
 
-impl<P: Priority, M> PriorityQueue<P, M> {
-    fn pop(&self) -> Option<Job<M>> {
+impl<P: Priority> PriorityQueue<P> {
+    fn pop(&self) -> Option<Job> {
         for ix in 0..P::COUNT {
             let stack = &self.stacks[ix];
 
@@ -57,7 +115,7 @@ impl<P: Priority, M> PriorityQueue<P, M> {
         None
     }
 
-    fn push(&self, priority: &P, job: Job<M>) {
+    fn push(&self, priority: &P, job: Job) {
         let index = priority.index();
 
         assert!(index < P::COUNT);
@@ -74,18 +132,17 @@ impl<P: Priority, M> PriorityQueue<P, M> {
     }
 }
 
-pub struct ThreadPool<P: Priority + Clone, M = ()> {
+pub struct ThreadPool<P: Priority + Clone> {
     jobs_queued: Arc<AtomicUsize>,
     should_stop: Arc<AtomicBool>,
     waiting: Vec<Arc<AtomicBool>>,
     threads: Vec<JoinHandle<()>>,
-    queue: PriorityQueue<P, M>,
+    queue: PriorityQueue<P>,
 }
 
-impl<P, M> ThreadPool<P, M>
+impl<P> ThreadPool<P>
 where
     P: Priority + Clone + Send + 'static,
-    M: Clone + Send + Sync + 'static,
 {
     pub fn new(nworkers: usize) -> Self {
         let jobs_queued = Arc::new(AtomicUsize::new(0));
@@ -173,13 +230,13 @@ where
         }
     }
 
-    pub fn queue(&self, priority: &P, runnable: Runnable<M>) {
+    pub fn queue<M: Send + Sync + 'static>(&self, priority: &P, runnable: Runnable<M>) {
         self.jobs_queued.fetch_add(1, Ordering::SeqCst);
         self.queue.push(
             priority,
             Job {
                 after: None,
-                runnable,
+                runnable: ErasedRunnable::new(runnable),
             },
         );
 
@@ -191,7 +248,7 @@ where
         //self.wake();
     }
 
-    pub fn queue_delayed(
+    pub fn queue_delayed<M: Send + Sync + 'static>(
         &self,
         priority: &P,
         duration: std::time::Duration,
@@ -202,7 +259,7 @@ where
             priority,
             Job {
                 after: Some(duration),
-                runnable,
+                runnable: ErasedRunnable::new(runnable),
             },
         );
 
